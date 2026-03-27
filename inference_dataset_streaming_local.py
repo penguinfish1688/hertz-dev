@@ -90,6 +90,8 @@ class LocalAudioProcessor:
         self.device = device
         self.temps = temps
         self.replay_seconds = max(0.0, float(replay_seconds))
+        self.replay_chunks = int(self.replay_seconds * 8)
+        self.replay_samples = int(TARGET_SR * self.replay_seconds)
         self.loaded_audio: T.Tensor | None = None
         self.recorded_audio: T.Tensor | None = None
         self.next_model_audio: T.Tensor | None = None
@@ -125,15 +127,19 @@ class LocalAudioProcessor:
             self.next_model_audio = self.model.next_audio_from_audio(self.loaded_audio.unsqueeze(0), temps=self.temps)
         assert self.next_model_audio is not None
 
-        prompt_audio = self.loaded_audio.reshape(1, 2, -1)
-        prompt_audio = prompt_audio[:, :, -(TARGET_SR * self.replay_seconds):].cpu().numpy()
-        prompt_audio_mono = prompt_audio.mean(axis=1)
-        self.prompt_buffer = np.array_split(prompt_audio_mono[0], int(self.replay_seconds * 8))
-        self.chunks_until_live = int(self.replay_seconds * 8)
+        if self.replay_chunks > 0 and self.replay_samples > 0:
+            prompt_audio = self.loaded_audio.reshape(1, 2, -1)
+            prompt_audio = prompt_audio[:, :, -self.replay_samples :].cpu().numpy()
+            prompt_audio_mono = prompt_audio.mean(axis=1)
+            self.prompt_buffer = np.array_split(prompt_audio_mono[0], self.replay_chunks)
+            self.chunks_until_live = self.replay_chunks
+        else:
+            self.prompt_buffer = []
+            self.chunks_until_live = 0
 
     def process_chunk(self, audio_data: np.ndarray) -> np.ndarray:
         if self.chunks_until_live > 0:
-            chunk = self.prompt_buffer[int(self.replay_seconds * 8) - self.chunks_until_live]
+            chunk = self.prompt_buffer[self.replay_chunks - self.chunks_until_live]
             self.chunks_until_live -= 1
             return chunk.astype(np.float32)
 
