@@ -79,9 +79,14 @@ def load_ckpt(load_from_location, expected_hash=None):
     os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = '1' #Disable this to speed up debugging errors with downloading from the hub
     if local0():
         repo_id = "si-pbc/hertz-dev"
-        print0(f'Loading checkpoint from repo_id {repo_id} and filename {load_from_location}.pt. This may take a while...')
-        save_path = hf_hub_download(repo_id=repo_id, filename=f"{load_from_location}.pt")
-        print0(f'Downloaded checkpoint to {save_path}')
+        filename = f"{load_from_location}.pt"
+        print0(f'Loading checkpoint from repo_id {repo_id} and filename {filename}...')
+        try:
+            save_path = hf_hub_download(repo_id=repo_id, filename=filename, local_files_only=True)
+            print0(f'Using cached checkpoint: {save_path}')
+        except Exception:
+            save_path = hf_hub_download(repo_id=repo_id, filename=filename)
+            print0(f'Downloaded checkpoint to {save_path}')
         if expected_hash is not None:
             with open(save_path, 'rb') as f:
                 file_hash = hashlib.md5(f.read()).hexdigest()
