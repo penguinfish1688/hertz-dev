@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-import time
 
 import numpy as np
 import torch as T
@@ -19,7 +18,7 @@ import torchaudio
 from model import get_hertz_dev_config
 
 TARGET_SR = 16000
-REPLAY_SECONDS = 3
+DEFAULT_REPLAY_SECONDS = 0.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,6 +39,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--categorical-temp", type=float, default=0.4, help="VAE categorical temperature")
     parser.add_argument("--gaussian-temp", type=float, default=0.1, help="VAE gaussian temperature")
     parser.add_argument("--device", type=str, default="cuda", help="Device, e.g. cuda or cpu")
+    parser.add_argument(
+        "--replay-seconds",
+        type=float,
+        default=DEFAULT_REPLAY_SECONDS,
+        help="Prompt replay seconds to prepend to output (server default is 3, offline alignment usually wants 0)",
+    )
     return parser.parse_args()
 
 
@@ -70,13 +75,21 @@ def from_i16(x: np.ndarray) -> np.ndarray:
 
 
 class LocalAudioProcessor:
-    def __init__(self, model, prompt_path: Path, chunk_size: int, device: str, temps: tuple[float, tuple[float, float]]):
+    def __init__(
+        self,
+        model,
+        prompt_path: Path,
+        chunk_size: int,
+        device: str,
+        temps: tuple[float, tuple[float, float]],
+        replay_seconds: float,
+    ):
         self.model = model
         self.prompt_path = prompt_path
         self.chunk_size = chunk_size
         self.device = device
         self.temps = temps
-        self.replay_seconds = REPLAY_SECONDS
+        self.replay_seconds = max(0.0, float(replay_seconds))
         self.loaded_audio: T.Tensor | None = None
         self.recorded_audio: T.Tensor | None = None
         self.next_model_audio: T.Tensor | None = None
@@ -103,12 +116,14 @@ class LocalAudioProcessor:
             loaded_audio = loaded_audio[..., : num_chunks * self.chunk_size]
 
         self.loaded_audio = loaded_audio.to(self.device)
+        assert self.loaded_audio is not None
         self.recorded_audio = self.loaded_audio.clone()
 
         cache_dtype = T.bfloat16 if self.device.startswith("cuda") else T.float32
         with T.autocast(device_type="cuda", dtype=T.bfloat16, enabled=self.device.startswith("cuda")), T.inference_mode():
             self.model.init_cache(bsize=1, device=self.device, dtype=cache_dtype, length=1024)
             self.next_model_audio = self.model.next_audio_from_audio(self.loaded_audio.unsqueeze(0), temps=self.temps)
+        assert self.next_model_audio is not None
 
         prompt_audio = self.loaded_audio.reshape(1, 2, -1)
         prompt_audio = prompt_audio[:, :, -(TARGET_SR * self.replay_seconds):].cpu().numpy()
@@ -120,8 +135,6 @@ class LocalAudioProcessor:
         if self.chunks_until_live > 0:
             chunk = self.prompt_buffer[int(self.replay_seconds * 8) - self.chunks_until_live]
             self.chunks_until_live -= 1
-            # Mirror server pacing during replay stage.
-            time.sleep(0.05)
             return chunk.astype(np.float32)
 
         assert self.next_model_audio is not None
@@ -184,6 +197,8 @@ def main() -> None:
 
     if args.chunk_size <= 0:
         raise SystemExit("[ERROR] --chunk-size must be positive")
+    if args.replay_seconds < 0:
+        raise SystemExit("[ERROR] --replay-seconds must be >= 0")
 
     prompt_path = args.prompt_path.expanduser().resolve()
     if not prompt_path.exists() or not prompt_path.is_file():
@@ -196,6 +211,7 @@ def main() -> None:
     print(f"[INIT] device={device}")
     print(f"[INIT] chunk_size={args.chunk_size}")
     print(f"[INIT] prompt_path={prompt_path}")
+    print(f"[INIT] replay_seconds={args.replay_seconds}")
 
     model_config = get_hertz_dev_config(is_split=True)
     model = model_config().eval().to(device)  # type: ignore[operator]
@@ -208,6 +224,7 @@ def main() -> None:
         chunk_size=args.chunk_size,
         device=device,
         temps=temps,
+        replay_seconds=args.replay_seconds,
     )
 
     input_paths = sorted(root_dir.rglob(args.input_name))
